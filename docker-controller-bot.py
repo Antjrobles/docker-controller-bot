@@ -25,9 +25,11 @@ from schedule_flow import (
 )
 from migrate_schedules import migrate_schedules
 
-VERSION = "3.11.0"
+VERSION = "3.11.1"
 
 _unmute_timer = None
+_mute_lock = threading.Lock()  # Lock for thread-safe mute timer operations
+_cache_lock = threading.Lock()  # Lock for thread-safe cache operations
 
 def debug(message):
 	print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - DEBUG: {message}')
@@ -585,36 +587,66 @@ class DockerEventMonitor:
 
 	def detectar_eventos_contenedores(self):
 		for event in self.client.events(decode=True):
-			if 'status' in event and 'Actor' in event and 'Attributes' in event['Actor']:
-				container_name = event['Actor']['Attributes'].get('name', '')
-				status = event['status']
+			# Only process container events
+			event_type = event.get('Type', '')
+			if event_type != 'container':
+				continue
 
-				message = None
-				if status == "start":
-					message = get_text("started_container", container_name)
-				elif status == "die":
-					message = get_text("stopped_container", container_name)
-				elif status == "create" and EXTENDED_MESSAGES:
-					message = get_text("created_container", container_name)
+			# Support both 'Action' (Docker Desktop/newer) and 'status' (Docker Engine/older) formats
+			action = event.get('Action', '') or event.get('status', '')
+			actor = event.get('Actor', {})
+			attributes = actor.get('Attributes', {})
+			container_name = attributes.get('name', '')
 
-				if message:
-					try:
-						if is_muted():
-							debug(f"Message [{message}] omitted because muted")
-							continue
+			message = None
+			if action == "start":
+				message = get_text("started_container", container_name)
+			elif action == "die":
+				message = get_text("stopped_container", container_name)
+			elif action == "create" and EXTENDED_MESSAGES:
+				message = get_text("created_container", container_name)
 
-						send_message_to_notification_channel(message=message)
-					except Exception as e:
-						error(f"Could not update container {message}. Error: [{e}]")
-						time.sleep(20) # Posible saturación de Telegram y el send_message lanza excepción
+			if message:
+				try:
+					if is_muted():
+						debug(f"Message [{message}] omitted because muted")
+						continue
+
+					send_message_to_notification_channel(message=message)
+				except Exception as e:
+					error(f"Could not send notification [{message}]. Error: [{e}]")
+					time.sleep(20) # Posible saturación de Telegram y el send_message lanza excepción
+
+	def _event_loop_with_retry(self):
+		"""Event loop wrapper with automatic retry on failure."""
+		max_retries = 5
+		retry_count = 0
+
+		while retry_count < max_retries:
+			try:
+				debug("Event monitor: Starting event listener...")
+				self.detectar_eventos_contenedores()
+				# If we get here, the event stream ended normally (shouldn't happen)
+				debug("Event monitor: Event stream ended unexpectedly, restarting...")
+				retry_count += 1
+			except Exception as e:
+				retry_count += 1
+				if retry_count >= max_retries:
+					error(f"Event monitor failed {max_retries} times. Stopping. Last error: [{e}]")
+					return
+				error(f"Event monitor error (attempt {retry_count}/{max_retries}). Retrying in 5 seconds... Error: [{e}]")
+				time.sleep(5)
+				# Reconnect to Docker
+				try:
+					self.client = docker.from_env()
+				except Exception as reconnect_error:
+					error(f"Event monitor: Failed to reconnect to Docker: {reconnect_error}")
 
 	def demonio_event(self):
-		try:
-			thread = threading.Thread(target=self.detectar_eventos_contenedores, daemon=True)
-			thread.start()
-		except Exception as e:
-			error(f"An error occurred in the event daemon. Relaunching... Error: [{e}]")
-			self.demonio_event()
+		"""Start event daemon in a background thread."""
+		thread = threading.Thread(target=self._event_loop_with_retry, daemon=True)
+		thread.start()
+		debug("Event monitor daemon started")
 
 
 class DockerUpdateMonitor:
@@ -709,12 +741,22 @@ class DockerUpdateMonitor:
 			time.sleep(CHECK_UPDATE_EVERY_HOURS * 3600)
 
 	def demonio_update(self):
-		try:
-			thread = threading.Thread(target=self.detectar_actualizaciones, daemon=True)
-			thread.start()
-		except Exception as e:
-			error(f"An error occurred in the update daemon. Relaunching... Error: [{e}]")
-			self.demonio_update()
+		"""Start update daemon with limited retries to prevent infinite restart loops."""
+		max_retries = 5
+		retry_count = 0
+
+		while retry_count < max_retries:
+			try:
+				thread = threading.Thread(target=self.detectar_actualizaciones, daemon=True)
+				thread.start()
+				return  # Successfully started
+			except Exception as e:
+				retry_count += 1
+				if retry_count >= max_retries:
+					error(f"Update daemon failed {max_retries} times. Stopping. Last error: [{e}]")
+					return
+				error(f"Update daemon error (attempt {retry_count}/{max_retries}). Retrying in 5 seconds... Error: [{e}]")
+				time.sleep(5)
 
 class DockerScheduleMonitor:
 	def __init__(self):
@@ -877,12 +919,22 @@ class DockerScheduleMonitor:
 			return False
 
 	def demonio_schedule(self):
-		try:
-			thread = threading.Thread(target=self.run, daemon=True)
-			thread.start()
-		except Exception as e:
-			error(f"An error occurred in the schedule daemon. Relaunching... Error: [{e}]")
-			self.demonio_schedule()
+		"""Start schedule daemon with limited retries to prevent infinite restart loops."""
+		max_retries = 5
+		retry_count = 0
+
+		while retry_count < max_retries:
+			try:
+				thread = threading.Thread(target=self.run, daemon=True)
+				thread.start()
+				return  # Successfully started
+			except Exception as e:
+				retry_count += 1
+				if retry_count >= max_retries:
+					error(f"Schedule daemon failed {max_retries} times. Stopping. Last error: [{e}]")
+					return
+				error(f"Schedule daemon error (attempt {retry_count}/{max_retries}). Retrying in 5 seconds... Error: [{e}]")
+				time.sleep(5)
 
 # ============================================================================
 # SCHEDULE INTERACTIVE FLOW FUNCTIONS
@@ -2581,41 +2633,47 @@ def get_temporal_file(data, fileName):
 	return fichero_temporal
 
 def mute(minutes):
+	"""Mute the bot with thread-safe lock to prevent race conditions."""
 	global _unmute_timer
 
 	if minutes == 0:
 		unmute()
 		return
 
-	# Cancel any existing unmute timer
-	if _unmute_timer is not None:
-		_unmute_timer.cancel()
-		_unmute_timer = None
+	# Use lock to prevent race conditions with unmute timer
+	with _mute_lock:
+		# Cancel any existing unmute timer
+		if _unmute_timer is not None:
+			_unmute_timer.cancel()
+			_unmute_timer = None
 
-	with open(FULL_MUTE_FILE_PATH, 'w') as mute_file:
-		mute_file.write(str(time.time() + minutes * 60))
-	debug(f"Bot muted for {minutes} minutes")
-	if EXTENDED_MESSAGES:
-		if minutes == 1:
-			send_message(message=get_text("muted_singular"))
-		else:
-			send_message(message=get_text("muted", minutes))
-	_unmute_timer = threading.Timer(minutes * 60, unmute)
-	_unmute_timer.start()
+		with open(FULL_MUTE_FILE_PATH, 'w') as mute_file:
+			mute_file.write(str(time.time() + minutes * 60))
+		debug(f"Bot muted for {minutes} minutes")
+		if EXTENDED_MESSAGES:
+			if minutes == 1:
+				send_message(message=get_text("muted_singular"))
+			else:
+				send_message(message=get_text("muted", minutes))
+		_unmute_timer = threading.Timer(minutes * 60, unmute)
+		_unmute_timer.start()
 
 def unmute():
+	"""Unmute the bot with thread-safe lock to prevent race conditions."""
 	global _unmute_timer
 
-	# Cancel any existing unmute timer
-	if _unmute_timer is not None:
-		_unmute_timer.cancel()
-		_unmute_timer = None
+	# Use lock to prevent race conditions with mute timer
+	with _mute_lock:
+		# Cancel any existing unmute timer
+		if _unmute_timer is not None:
+			_unmute_timer.cancel()
+			_unmute_timer = None
 
-	with open(FULL_MUTE_FILE_PATH, 'w') as mute_file:
-		mute_file.write('0')
-	debug("Bot unmuted")
-	if EXTENDED_MESSAGES:
-		send_message(message=get_text("unmuted"))
+		with open(FULL_MUTE_FILE_PATH, 'w') as mute_file:
+			mute_file.write('0')
+		debug("Bot unmuted")
+		if EXTENDED_MESSAGES:
+			send_message(message=get_text("unmuted"))
 
 def is_muted():
 	with open(FULL_MUTE_FILE_PATH, 'r') as fichero:
@@ -2968,24 +3026,30 @@ def sanitize_text_for_filename(text):
 	return sanitized
 
 def write_cache_item(key, value):
-	try:
-		pickle.dump(value, open(f'{DIR["cache"]}{key}', 'wb'))
-	except:
-		error(f"Error writing cache item: {key}")
+	"""Write cache item with thread-safe lock to prevent corruption."""
+	with _cache_lock:
+		try:
+			pickle.dump(value, open(f'{DIR["cache"]}{key}', 'wb'))
+		except Exception as e:
+			error(f"Error writing cache item: {key} - {e}")
 
 def read_cache_item(key):
-	try:
-		return pickle.load(open(f'{DIR["cache"]}{key}', 'rb'))
-	except:
-		return None
+	"""Read cache item with thread-safe lock to prevent corruption."""
+	with _cache_lock:
+		try:
+			return pickle.load(open(f'{DIR["cache"]}{key}', 'rb'))
+		except:
+			return None
 
 def delete_cache_item(key):
+	"""Delete cache item with thread-safe lock to prevent corruption."""
 	path = f'{DIR["cache"]}{key}'
-	try:
-		if os.path.exists(path):
-			os.remove(path)
-	except Exception as e:
-		pass
+	with _cache_lock:
+		try:
+			if os.path.exists(path):
+				os.remove(path)
+		except Exception as e:
+			pass
 
 def save_container_update_status(image_with_tag, container_name, value):
 	key = f'{sanitize_text_for_filename(image_with_tag)}_{sanitize_text_for_filename(container_name)}'
