@@ -380,7 +380,7 @@ def _perform_update_locked(client, container, config, container_name, message, e
 				volumes=config['volumes'],
 				mounts=config['mounts_list'] if config['mounts_list'] else None,
 				network_mode=config['network_mode'],
-				networking_config=networking_config,
+				# networking_config=networking_config, # REMOVED due to compatibility issues
 				hostname=config['hostname'],
 				domainname=config['domainname'],
 				dns=config['dns'] if config['dns'] else None,

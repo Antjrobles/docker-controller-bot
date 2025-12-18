@@ -1,0 +1,22 @@
+version: '3.3'
+services:
+    docker-controller-bot:
+        build: . 
+        environment:
+            - TELEGRAM_TOKEN=6907092904:AAHohfiP-gfipwwX-8mKPCkw_XV5TddX_lA
+            - TELEGRAM_ADMIN=805841226
+            - CONTAINER_NAME=docker-controller-bot
+            - CHECK_UPDATE_EVERY_HOURS=168
+            # CONFIGURACIÓN MULTI-SERVIDOR
+            # Formato: Nombre|URL;Nombre2|URL2
+            # Ajusta el usuario SSH (user@...) según corresponda
+            - DOCKER_HOSTS=Local|unix://var/run/docker.sock;RASPY2|ssh://user@192.168.0.33;RASPY4|ssh://user@192.168.0.42;RASPY4B|ssh://user@192.168.0.52;RASPY4D|ssh://user@192.168.0.26;RASPY5|ssh://user@192.168.0.32
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+            - /etc/localtime:/etc/localtime:ro
+            # IMPORTANTE: Montar las claves SSH para poder conectar sin contraseña
+            - /home/antjrobles/.ssh:/root/.ssh:ro
+        container_name: docker-controller-bot
+        restart: always
+        network_mode: host
+        tty: true

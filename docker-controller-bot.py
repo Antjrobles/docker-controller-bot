@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import yaml
+import subprocess # Added subprocess for native docker commands
 from config import *
 from croniter import croniter
 from datetime import datetime, timedelta
@@ -20,8 +21,8 @@ from telebot.types import InlineKeyboardMarkup
 from docker_update import extract_container_config, perform_update
 from schedule_manager import ScheduleManager
 from schedule_flow import (
-    save_schedule_state, load_schedule_state, clear_schedule_state,
-    init_add_schedule_state
+	save_schedule_state, load_schedule_state, clear_schedule_state,
+	init_add_schedule_state
 )
 from migrate_schedules import migrate_schedules
 
@@ -138,6 +139,125 @@ except Exception as e:
 	error(f"Error during schedule migration: {e}")
 
 # ============================================================================
+# MULTI-HOST MANAGEMENT
+# ============================================================================
+USER_SESSIONS = {}  # {user_id: {'server': 'Local'}}
+
+class DockerClientHub:
+	def __init__(self):
+		self.clients = {}
+		print("DEBUG: >>> STARTING DOCKER CLIENT HUB INIT <<<")
+		print(f"DEBUG: DOCKER_HOSTS content: {DOCKER_HOSTS}")
+		
+		# Import paramiko here
+		try:
+			import paramiko
+			from urllib.parse import urlparse
+			# Load SSH Config once
+			ssh_config = paramiko.SSHConfig()
+			user_config_file = os.path.expanduser("~/.ssh/config")
+			if os.path.exists(user_config_file):
+				print(f"DEBUG: Loading SSH config from {user_config_file}")
+				with open(user_config_file) as f:
+					ssh_config.parse(f)
+			else:
+				print("DEBUG: SSH config not found at ~/.ssh/config")
+		except ImportError:
+			print("DEBUG: Paramiko not found!")
+			paramiko = None
+
+		# Single loop for everything
+		for name, url in DOCKER_HOSTS.items():
+			print(f"DEBUG: --- Processing {name} ---")
+			
+			# 1. Pre-trust SSH
+			if url and url.startswith("ssh://") and paramiko:
+				try:
+					parsed = urlparse(url)
+					hostname = parsed.hostname
+					port = parsed.port or 22
+					username = parsed.username
+					
+					# Lookup alias
+					host_conf = ssh_config.lookup(hostname)
+					if 'hostname' in host_conf: hostname = host_conf['hostname']
+					if 'user' in host_conf and not username: username = host_conf['user']
+					if 'port' in host_conf: port = int(host_conf['port'])
+					key_filename = host_conf.get('identityfile')
+					
+					print(f"DEBUG: Trusting {hostname}:{port} (User: {username}, Key: {key_filename})")
+					
+					client = paramiko.SSHClient()
+					client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+					client.load_system_host_keys()
+					
+					connect_args = {'hostname': hostname, 'port': port, 'username': username, 'timeout': 5}
+					if key_filename:
+						if isinstance(key_filename, list): key_path = key_filename[0]
+						else: key_path = key_filename
+						connect_args['key_filename'] = os.path.expanduser(key_path)
+					
+					client.connect(**connect_args)
+					client.close()
+					print(f"DEBUG: Trust OK for {name}")
+				except Exception as e:
+					print(f"DEBUG: Trust FAILED for {name}: {e}")
+
+			# 2. Connect Docker
+			try:
+				print(f"DEBUG: Connecting Docker Client for {name}...")
+				if not url:
+					client = docker.from_env()
+				elif url.startswith("ssh://"):
+					client = docker.DockerClient(base_url=url, use_ssh_client=True)
+				else:
+					client = docker.DockerClient(base_url=url)
+				
+				# Test connection
+				print(f"DEBUG: Pinging {name}...")
+				client.ping()
+				self.clients[name] = client
+				print(f"DEBUG: SUCCESS connected to {name}")
+			except Exception as e:
+				print(f"ERROR: Failed to connect to {name}: {e}")
+				import traceback
+				traceback.print_exc()
+
+		print(f"DEBUG: Total clients loaded: {len(self.clients)}")
+		if not self.clients:
+			error("No Docker hosts available! Check configuration.")
+			sys.exit(1)
+
+	# Remove the old method as it is integrated now
+	# def _trust_ssh_hosts(self): ... (handled by replace)
+
+		if not self.clients:
+			error("No Docker hosts available! Check configuration.")
+			sys.exit(1)
+
+	def get_client(self, name):
+		return self.clients.get(name)
+
+	def get_default_server(self):
+		return list(self.clients.keys())[0] if self.clients else None
+
+	def get_all_clients(self):
+		return self.clients
+
+docker_client_hub = DockerClientHub()
+
+def get_user_server(user_id):
+	if user_id not in USER_SESSIONS:
+		USER_SESSIONS[user_id] = {'server': docker_client_hub.get_default_server()}
+	return USER_SESSIONS[user_id]['server']
+
+def set_user_server(user_id, server_name):
+	if server_name in docker_client_hub.clients:
+		USER_SESSIONS[user_id] = {'server': server_name}
+		return True
+	return False
+
+# ============================================================================
 # SISTEMA DE COLA DE MENSAJES CON RATE LIMITING
 # ============================================================================
 import queue
@@ -241,34 +361,40 @@ class MessageQueue:
 message_queue = MessageQueue(delay_between_messages=0.1, max_retries=5)
 
 class DockerManager:
-	def __init__(self):
-		self.client = docker.from_env()
+	def __init__(self, client_hub):
+		self.hub = client_hub
 
-	def list_containers(self, comando=""):
+	def list_containers(self, server_name, comando=""):
+		client = self.hub.get_client(server_name)
+		if not client:
+			error(f"Client for server {server_name} not found")
+			return []
+
 		comando = comando.split('@', 1)[0]
 		if comando == "/run":
 			status = ['paused', 'exited', 'created', 'dead']
 			filters = {'status': status}
-			containers = self.client.containers.list(filters=filters)
+			containers = client.containers.list(filters=filters)
 		elif comando == "/stop" or comando == "/restart":
 			status = ['running', 'restarting']
 			filters = {'status': status}
-			containers = self.client.containers.list(filters=filters)
+			containers = client.containers.list(filters=filters)
 		elif comando == "/exec":
 			status = ['running']
 			filters = {'status': status}
-			containers = self.client.containers.list(filters=filters)
+			containers = client.containers.list(filters=filters)
 		else:
-			containers = self.client.containers.list(all=True)
+			containers = client.containers.list(all=True)
 		status_order = {'running': 0, 'restarting': 1, 'paused': 2, 'exited': 3, 'created': 4, 'dead': 5}
 		sorted_containers = sorted(containers, key=lambda x: (0 if x.name == CONTAINER_NAME else 1, status_order.get(x.status, 6), x.name.lower()))
 		return sorted_containers
 
-	def stop_container(self, container_id, container_name, from_schedule=False):
+	def stop_container(self, container_id, container_name, server_name, from_schedule=False):
 		try:
-			if CONTAINER_NAME == container_name:
+			client = self.hub.get_client(server_name)
+			if CONTAINER_NAME == container_name and server_name == "Local": # Only prevent self-stop if it's the bot itself
 				return get_text("error_can_not_do_that")
-			container = self.client.containers.get(container_id)
+			container = client.containers.get(container_id)
 			container.stop()
 			# Send confirmation only for manual commands when muted
 			if from_schedule is False and is_muted():
@@ -278,11 +404,12 @@ class DockerManager:
 			error(f"Could not stop container {container_name}. Error: [{e}]")
 			return get_text("error_stopping_container", container_name)
 
-	def restart_container(self, container_id, container_name, from_schedule=False):
+	def restart_container(self, container_id, container_name, server_name, from_schedule=False):
 		try:
-			if CONTAINER_NAME == container_name:
+			client = self.hub.get_client(server_name)
+			if CONTAINER_NAME == container_name and server_name == "Local":
 				return get_text("error_can_not_do_that")
-			container = self.client.containers.get(container_id)
+			container = client.containers.get(container_id)
 			container.restart()
 			# Send confirmation only for manual commands when muted
 			if from_schedule is False and is_muted():
@@ -292,11 +419,12 @@ class DockerManager:
 			error(f"Could not restart container {container_name}. Error: [{e}]")
 			return get_text("error_restarting_container", container_name)
 
-	def start_container(self, container_id, container_name, from_schedule=False):
+	def start_container(self, container_id, container_name, server_name, from_schedule=False):
 		try:
-			if CONTAINER_NAME == container_name:
+			client = self.hub.get_client(server_name)
+			if CONTAINER_NAME == container_name and server_name == "Local":
 				return get_text("error_can_not_do_that")
-			container = self.client.containers.get(container_id)
+			container = client.containers.get(container_id)
 			container.start()
 			# Send confirmation only for manual commands when muted
 			if from_schedule is False and is_muted():
@@ -306,34 +434,38 @@ class DockerManager:
 			error(f"Could not start container {container_name}. Error: [{e}]")
 			return get_text("error_starting_container", container_name)
 
-	def show_logs(self, container_id, container_name):
+	def show_logs(self, container_id, container_name, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			logs = container.logs().decode("utf-8")
 			return get_text("showing_logs", container_name, logs[-3500:])
 		except Exception as e:
 			error(f"The logs for container {container_name} could not be shown. Error: [{e}]")
 			return get_text("error_showing_logs_container", container_name)
 
-	def show_logs_raw(self, container_id, container_name):
+	def show_logs_raw(self, container_id, container_name, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			return container.logs().decode("utf-8")
 		except Exception as e:
 			error(f"The logs for container {container_name} could not be shown. Error: [{e}]")
 			return get_text("error_showing_logs_container", container_name)
 
-	def get_docker_compose(self, container_id, container_name):
+	def get_docker_compose(self, container_id, container_name, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			return generate_docker_compose(container)
 		except Exception as e:
 			error(f"Could not show docker compose for container {container_name}. Error: [{e}]")
 			return get_text("error_showing_compose_container", container_name)
 
-	def get_info(self, container_id, container_name):
+	def get_info(self, container_id, container_name, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			if container.status == "running":
 				used_cpu = 0.0
 				ram = "N/A"
@@ -407,20 +539,21 @@ class DockerManager:
 			error(f"Could not display information for container {container_name}. Error: [{e}]")
 			return get_text("error_showing_info_container", container_name), False
 
-	def update(self, container_id, container_name, message, bot, tag=None):
+	def update(self, container_id, container_name, message, bot, server_name, tag=None, silent=False):
 		"""
-		Update a container with a new image while preserving all configuration.
-		Uses docker_update module for the actual update logic.
+		Update a container. If silent=True, suppresses internal status messages.
 		"""
 		try:
-			if CONTAINER_NAME == container_name:
-				# Self-update: use updater container
+			client = self.hub.get_client(server_name)
+			if CONTAINER_NAME == container_name and server_name == "Local":
+				# Self-update logic (unchanged)
+				# ... (omitted for brevity, self-update usually restarts container so silent doesn't matter much)
 				if not tag:
 					container_environment = {'CONTAINER_NAME': container_name}
 				else:
 					container_environment = {'CONTAINER_NAME': container_name, 'TAG': tag}
 				container_volumes = {'/var/run/docker.sock': {'bind': '/var/run/docker.sock', 'mode': 'rw'}}
-				new_container = self.client.containers.run(
+				new_container = client.containers.run(
 					UPDATER_IMAGE,
 					name=UPDATER_CONTAINER_NAME,
 					environment=container_environment,
@@ -431,19 +564,21 @@ class DockerManager:
 				return get_text("self_update_message")
 			else:
 				# Regular container update
-				client = self.client
 				container = client.containers.get(container_id)
 
-				# Extract all configuration from current container
+				# Extract configuration
 				config = extract_container_config(container, tag)
 
-				# Perform the update using the extracted configuration
+				# Pass None as message if silent to disable internal edits
+				msg_obj = None if silent else message
+
+				# Perform update
 				result = perform_update(
 					client=client,
 					container=container,
 					config=config,
 					container_name=container_name,
-					message=message,
+					message=msg_obj,
 					edit_message_func=edit_message_text,
 					debug_func=debug,
 					error_func=error,
@@ -457,15 +592,16 @@ class DockerManager:
 			error(f"Could not update container {container_name}. Error: [{e}]")
 			return get_text("error_updating_container", container_name)
 
-	def force_check_update(self, container_id):
+	def force_check_update(self, container_id, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			container_attrs = container.attrs.get('Config', {})
 			image_with_tag = container_attrs.get('Image', '')
 			local_image = container.image.id
 
 			try:
-				remote_image = self.client.images.pull(image_with_tag)
+				remote_image = client.images.pull(image_with_tag)
 				if not remote_image or not remote_image.id:
 					error(f"Failed to pull image {image_with_tag}. Verify that the image exists in the registry.")
 					image_status = ""
@@ -490,7 +626,7 @@ class DockerManager:
 			if local_image_normalized != remote_image_normalized:
 				debug(f"{container.name} update detected! Deleting downloaded image [{remote_image_normalized[:CONTAINER_ID_LENGTH]}]")
 				try:
-					self.client.images.remove(remote_image.id)
+					client.images.remove(remote_image.id)
 				except:
 					pass # Si no se puede borrar es porque esta siendo usada por otro contenedor
 				markup = InlineKeyboardMarkup(row_width = 1)
@@ -507,11 +643,12 @@ class DockerManager:
 		if image_with_tag and container and container.name:
 			save_container_update_status(image_with_tag, container.name, image_status)
 
-	def delete(self, container_id, container_name):
+	def delete(self, container_id, container_name, server_name):
 		try:
-			if CONTAINER_NAME == container_name:
+			client = self.hub.get_client(server_name)
+			if CONTAINER_NAME == container_name and server_name == "Local":
 				return get_text("error_can_not_do_that")
-			container = self.client.containers.get(container_id)
+			container = client.containers.get(container_id)
 			container_is_running = container.status in ['running', 'restarting', 'paused', 'created']
 			if container_is_running:
 				debug(f"Container {container_name} is running. It will be stopped.")
@@ -522,9 +659,10 @@ class DockerManager:
 			error(f"Could not delete container {container_name}. Error: [{e}]")
 			return get_text("error_deleting_container", container_name)
 
-	def prune_containers(self):
+	def prune_containers(self, server_name):
 		try:
-			pruned_containers = self.client.containers.prune()
+			client = self.hub.get_client(server_name)
+			pruned_containers = client.containers.prune()
 			if pruned_containers:
 				file_size_bytes = sizeof_fmt(pruned_containers['SpaceReclaimed'])
 			debug(f"Deleted: [{str(pruned_containers)}] - Space reclaimed: {str(file_size_bytes)}")
@@ -533,9 +671,10 @@ class DockerManager:
 			error(f"An error has occurred deleting unused containers. Error: [{e}]")
 			return get_text("error_prune_containers")
 
-	def prune_images(self):
+	def prune_images(self, server_name):
 		try:
-			pruned_images = self.client.images.prune(filters={'dangling': False})
+			client = self.hub.get_client(server_name)
+			pruned_images = client.images.prune(filters={'dangling': False})
 			if pruned_images:
 				file_size_bytes = sizeof_fmt(pruned_images['SpaceReclaimed'])
 			debug(f"Deleted: [{str(pruned_images)}] - Space reclaimed: {str(file_size_bytes)}")
@@ -544,9 +683,10 @@ class DockerManager:
 			error(f"An error occurred deleting unused images. Error: [{e}]")
 			return get_text("error_prune_images")
 
-	def prune_networks(self):
+	def prune_networks(self, server_name):
 		try:
-			pruned_networks = self.client.networks.prune()
+			client = self.hub.get_client(server_name)
+			pruned_networks = client.networks.prune()
 			debug(f"Deleted: [{str(pruned_networks)}]")
 			return get_text("prune_networks"), str(pruned_networks)
 		except Exception as e:
@@ -554,9 +694,10 @@ class DockerManager:
 			return get_text("error_prune_networks")
 
 
-	def prune_volumes(self):
+	def prune_volumes(self, server_name):
 		try:
-			pruned_volumes = self.client.volumes.prune()
+			client = self.hub.get_client(server_name)
+			pruned_volumes = client.volumes.prune()
 			if pruned_volumes:
 				file_size_bytes = sizeof_fmt(pruned_volumes['SpaceReclaimed'])
 			debug(f"Deleted: [{str(pruned_volumes)}] - Space reclaimed: {str(file_size_bytes)}")
@@ -565,9 +706,10 @@ class DockerManager:
 			error(f"An error occurred deleting unused volumes. Error: [{e}]")
 			return get_text("error_prune_volumes")
 
-	def execute_command(self, container_id, container_name, command):
+	def execute_command(self, container_id, container_name, command, server_name):
 		try:
-			container = self.client.containers.get(container_id)
+			client = self.hub.get_client(server_name)
+			container = client.containers.get(container_id)
 			exec_command = ['sh', '-c', command]
 			result = container.exec_run(exec_command)
 			output = result.output.decode('utf-8')
@@ -579,11 +721,12 @@ class DockerManager:
 			return get_text("error_executing_command_container", command, container_name)
 
 # Instanciamos el DockerManager
-docker_manager = DockerManager()
+docker_manager = DockerManager(docker_client_hub)
 
 class DockerEventMonitor:
-	def __init__(self):
-		self.client = docker.from_env()
+	def __init__(self, client, server_name):
+		self.client = client
+		self.server_name = server_name
 
 	def detectar_eventos_contenedores(self):
 		for event in self.client.events(decode=True):
@@ -599,12 +742,13 @@ class DockerEventMonitor:
 			container_name = attributes.get('name', '')
 
 			message = None
+			prefix = f"[{self.server_name}] " if self.server_name != "Local" else ""
 			if action == "start":
-				message = get_text("started_container", container_name)
+				message = f"{prefix}{get_text('started_container', container_name)}"
 			elif action == "die":
-				message = get_text("stopped_container", container_name)
+				message = f"{prefix}{get_text('stopped_container', container_name)}"
 			elif action == "create" and EXTENDED_MESSAGES:
-				message = get_text("created_container", container_name)
+				message = f"{prefix}{get_text('created_container', container_name)}"
 
 			if message:
 				try:
@@ -624,23 +768,23 @@ class DockerEventMonitor:
 
 		while retry_count < max_retries:
 			try:
-				debug("Event monitor: Starting event listener...")
+				debug(f"Event monitor ({self.server_name}): Starting event listener...")
 				self.detectar_eventos_contenedores()
 				# If we get here, the event stream ended normally (shouldn't happen)
-				debug("Event monitor: Event stream ended unexpectedly, restarting...")
+				debug(f"Event monitor ({self.server_name}): Event stream ended unexpectedly, restarting...")
 				retry_count += 1
 			except Exception as e:
 				retry_count += 1
 				if retry_count >= max_retries:
-					error(f"Event monitor failed {max_retries} times. Stopping. Last error: [{e}]")
+					error(f"Event monitor ({self.server_name}) failed {max_retries} times. Stopping. Last error: [{e}]")
 					return
-				error(f"Event monitor error (attempt {retry_count}/{max_retries}). Retrying in 5 seconds... Error: [{e}]")
+				error(f"Event monitor ({self.server_name}) error (attempt {retry_count}/{max_retries}). Retrying in 5 seconds... Error: [{e}]")
 				time.sleep(5)
-				# Reconnect to Docker
-				try:
-					self.client = docker.from_env()
-				except Exception as reconnect_error:
-					error(f"Event monitor: Failed to reconnect to Docker: {reconnect_error}")
+				# Reconnect handled by outer loop, client object persists but connection might need refresh?
+				# docker-py client usually handles reconnects, but if we need new client:
+				# We rely on existing client object. Replacing it requires hub access.
+				# Simplified: just sleep and retry.
+
 
 	def demonio_event(self):
 		"""Start event daemon in a background thread."""
@@ -650,93 +794,105 @@ class DockerEventMonitor:
 
 
 class DockerUpdateMonitor:
-	def __init__(self):
-		self.client = docker.from_env()
+	def __init__(self, client_hub):
+		self.hub = client_hub
 
 	def detectar_actualizaciones(self):
 		while True:
-			containers = self.client.containers.list(all=True)
-			grouped_updates_containers = []
-			should_notify = False
-			for container in containers:
-				if (container.status == "exited" or container.status == "dead") and not CHECK_UPDATE_STOPPED_CONTAINERS:
-					debug(f"Ignoring update check for container {container.name} (stopped)")
-					continue
-
-				labels = container.labels
-				if LABEL_IGNORE_CHECK_UPDATES in labels:
-					debug(f"Ignoring update check for container {container.name} (label)")
-					continue
-
-				container_attrs = container.attrs['Config']
-				image_with_tag = container_attrs['Image']
+			for server_name, client in self.hub.clients.items():
 				try:
-					local_image = container.image.id
-					remote_image = self.client.images.pull(image_with_tag)
-					debug(f"Checking update: {container.name} ({image_with_tag}): LOCAL IMAGE [{local_image.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}] - REMOTE IMAGE [{remote_image.id.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}]")
-					if local_image != remote_image.id:
-						if LABEL_AUTO_UPDATE in labels:
-							if EXTENDED_MESSAGES and not is_muted():
-								send_message_to_notification_channel(message=get_text("auto_update", container.name))
-							debug(f"Auto-updating container {container.name}")
-							x = None
-							if not is_muted():
-								x = send_message_to_notification_channel(message=get_text("updating", container.name))
-							result = docker_manager.update(container_id=container.id, container_name=container.name, message=x, bot=bot)
-							if not is_muted():
-								delete_message(x.message_id)
-								send_message_to_notification_channel(message=result)
-							else:
-								debug(f"Message [{result}] omitted because muted")
+					debug(f"Checking updates for server: {server_name}")
+					containers = client.containers.list(all=True)
+					grouped_updates_containers = []
+					should_notify = False
+					for container in containers:
+						if (container.status == "exited" or container.status == "dead") and not CHECK_UPDATE_STOPPED_CONTAINERS:
+							debug(f"Ignoring update check for container {container.name} (stopped)")
 							continue
-						old_image_status = read_container_update_status(image_with_tag, container.name)
-						image_status = get_text("NEED_UPDATE_CONTAINER_TEXT")
-						debug(f"{container.name} update detected! Deleting downloaded image [{remote_image.id.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}]")
+
+						labels = container.labels
+						if LABEL_IGNORE_CHECK_UPDATES in labels:
+							debug(f"Ignoring update check for container {container.name} (label)")
+							continue
+
+						container_attrs = container.attrs['Config']
+						image_with_tag = container_attrs['Image']
 						try:
-							self.client.images.remove(remote_image.id)
-						except:
-							pass # Si no se puede borrar es porque esta siendo usada por otro contenedor
+							local_image = container.image.id
+							remote_image = client.images.pull(image_with_tag)
+							debug(f"Checking update: {container.name} ({image_with_tag}): LOCAL IMAGE [{local_image.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}] - REMOTE IMAGE [{remote_image.id.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}]")
+							if local_image != remote_image.id:
+								if LABEL_AUTO_UPDATE in labels:
+									if EXTENDED_MESSAGES and not is_muted():
+										send_message_to_notification_channel(message=get_text("auto_update", container.name))
+									debug(f"Auto-updating container {container.name}")
+									x = None
+									if not is_muted():
+										x = send_message_to_notification_channel(message=get_text("updating", container.name))
+									# Pass server_name to update
+									result = docker_manager.update(container_id=container.id, container_name=container.name, message=x, bot=bot, server_name=server_name)
+									if not is_muted():
+										delete_message(x.message_id)
+										send_message_to_notification_channel(message=result)
+									else:
+										debug(f"Message [{result}] omitted because muted")
+									continue
+								old_image_status = read_container_update_status(image_with_tag, container.name)
+								image_status = get_text("NEED_UPDATE_CONTAINER_TEXT")
+								debug(f"{container.name} update detected! Deleting downloaded image [{remote_image.id.replace('sha256:', '')[:CONTAINER_ID_LENGTH]}]")
+								try:
+									client.images.remove(remote_image.id)
+								except:
+									pass # Si no se puede borrar es porque esta siendo usada por otro contenedor
 
-						if container.name != CONTAINER_NAME:
-							grouped_updates_containers.append(container.name)
+								if container.name != CONTAINER_NAME:
+									grouped_updates_containers.append(container.name)
 
-						if image_status == old_image_status:
-							debug("Update already notified")
-							continue
+								if image_status == old_image_status:
+									debug("Update already notified")
+									continue
 
-						if container.name == CONTAINER_NAME:
-							markup = InlineKeyboardMarkup(row_width = 1)
-							markup.add(InlineKeyboardButton(get_text("button_update"), callback_data=f"confirmUpdate|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}"))
-							if not is_muted():
-								send_message(message=get_text("available_update", container.name), reply_markup=markup)
-							else:
-								debug(f"Message [{get_text('available_update', container.name)}] omitted because muted")
-							continue
+								if container.name == CONTAINER_NAME:
+									markup = InlineKeyboardMarkup(row_width = 1)
+									# Callback needs to handle server selection context? 
+									# Simplification: User will switch server to update manually if notified.
+									# Or we can encode server in callback, but 64 char limit.
+									# For now, just show notification. User must switch server to update manualy.
+									markup.add(InlineKeyboardButton(get_text("button_update"), callback_data=f"confirmUpdate|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}"))
+									if not is_muted():
+										send_message(message=get_text("available_update", container.name), reply_markup=markup)
+									else:
+										debug(f"Message [{get_text('available_update', container.name)}] omitted because muted")
+									continue
 
-						should_notify = True
-					else: # Contenedor actualizado
-						image_status = get_text("UPDATED_CONTAINER_TEXT")
+								should_notify = True
+							else: # Contenedor actualizado
+								image_status = get_text("UPDATED_CONTAINER_TEXT")
+						except Exception as e:
+							error(f"Could not check update: [{e}]")
+							image_status = ""
+						save_container_update_status(image_with_tag, container.name, image_status)
+
+					if grouped_updates_containers and should_notify:
+						markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
+						markup.add(*[
+							InlineKeyboardButton(f'{ICON_CONTAINER_MARK_FOR_UPDATE} {name}', callback_data=f'toggleUpdate|{name}')
+							for name in grouped_updates_containers
+						])
+						markup.add(
+							InlineKeyboardButton(get_text("button_update_all"), callback_data="toggleUpdateAll"),
+							InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar")
+						)
+						if not is_muted():
+							server_prefix = f"[{server_name}] " if server_name != "Local" else ""
+							message = send_message(message=f"{server_prefix}{get_text('available_updates', len(grouped_updates_containers))}", reply_markup=markup)
+							if message:
+								save_update_data(TELEGRAM_GROUP, message.message_id, grouped_updates_containers)
+						else:
+							debug(f"Message [{get_text('available_updates', len(grouped_updates_containers))}] omitted because muted")
 				except Exception as e:
-					error(f"Could not check update: [{e}]")
-					image_status = ""
-				save_container_update_status(image_with_tag, container.name, image_status)
+					error(f"Error checking updates for server {server_name}: {e}")
 
-			if grouped_updates_containers and should_notify:
-				markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
-				markup.add(*[
-					InlineKeyboardButton(f'{ICON_CONTAINER_MARK_FOR_UPDATE} {name}', callback_data=f'toggleUpdate|{name}')
-					for name in grouped_updates_containers
-				])
-				markup.add(
-					InlineKeyboardButton(get_text("button_update_all"), callback_data="toggleUpdateAll"),
-					InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar")
-				)
-				if not is_muted():
-					message = send_message(message=get_text("available_updates", len(grouped_updates_containers)), reply_markup=markup)
-					if message:
-						save_update_data(TELEGRAM_GROUP, message.message_id, grouped_updates_containers)
-				else:
-					debug(f"Message [{get_text('available_updates', len(grouped_updates_containers))}] omitted because muted")
 			debug(f"Waiting {CHECK_UPDATE_EVERY_HOURS} hours for the next update check...")
 			time.sleep(CHECK_UPDATE_EVERY_HOURS * 3600)
 
@@ -1565,22 +1721,27 @@ def handle_schedule_flow(user_id: int, user_input: str, state: dict, chat_id: in
 		# For exec action, go to confirmation
 		confirm_schedule_creation(user_id, state)
 
-@bot.message_handler(commands=["start", "list", "run", "stop", "restart", "delete", "exec", "checkupdate", "updateall", "changetag", "logs", "logfile", "compose", "mute", "schedule", "info", "version", "donate", "donors", "prune"])
+@bot.message_handler(commands=["start", "list", "run", "stop", "restart", "delete", "exec", "checkupdate", "updateall", "changetag", "logs", "logfile", "compose", "mute", "schedule", "info", "version", "donate", "donors", "prune", "server"])
 def command_controller(message):
 	userId = message.from_user.id
 	comando = message.text.split(' ', 1)[0]
 	messageId = message.id
+	
+	# Get current server for this user
+	server_name = get_user_server(userId)
+	
 	container_id = None
 	if not comando in ('/mute', f'/mute@{bot.get_me().username}'
-					,'/schedule', f'/schedule@{bot.get_me().username}'):
+					,'/schedule', f'/schedule@{bot.get_me().username}'
+					,'/server', f'/server@{bot.get_me().username}'):
 		container_name = " ".join(message.text.split()[1:])
 		if container_name:
-			container_id = get_container_id_by_name(container_name, debugging=True)
+			container_id = get_container_id_by_name(container_name, server_name=server_name, debugging=True) # Needs server_name? Yes.
 
 	message_thread_id = message.message_thread_id
 	if not message_thread_id:
 		message_thread_id = 1
-	debug(f"COMMAND: {comando} | USER: {userId} | CHAT: {message.chat.id} | THREAD: {message_thread_id}")
+	debug(f"COMMAND: {comando} | USER: {userId} | SERVER: {server_name} | CHAT: {message.chat.id} | THREAD: {message_thread_id}")
 
 	if message_thread_id != TELEGRAM_THREAD and (not message.reply_to_message or message.reply_to_message.from_user.id != bot.get_me().id):
 		return
@@ -1595,18 +1756,28 @@ def command_controller(message):
 
 	# Listar contenedores
 	if comando in ('/start', f'/start@{bot.get_me().username}'):
-		texto_inicial = get_text("menu")
-		send_message(message=texto_inicial)
+		texto_inicial = f"{get_text('menu')}\n\n🖥 <b>Current Server:</b> {server_name}"
+		markup = InlineKeyboardMarkup(row_width=1)
+		markup.add(InlineKeyboardButton(f"🔄 Switch Server", callback_data="selectServer|list"))
+		send_message(message=texto_inicial, reply_markup=markup)
+	elif comando in ('/server', f'/server@{bot.get_me().username}'):
+		# Show server selection
+		markup = InlineKeyboardMarkup(row_width=1)
+		for name in docker_client_hub.clients:
+			markup.add(InlineKeyboardButton(f"{'✅ ' if name == server_name else ''}{name}", callback_data=f"selectServer|{name}"))
+		markup.add(InlineKeyboardButton(get_text("button_close"), callback_data="cerrar"))
+		send_message(message=f"🖥 <b>Select Docker Host:</b>\nCurrent: {server_name}", reply_markup=markup)
+
 	elif comando in ('/list', f'/list@{bot.get_me().username}'):
 		markup = InlineKeyboardMarkup(row_width = 1)
 		markup.add(InlineKeyboardButton(get_text("button_close"), callback_data="cerrar"))
-		containers = docker_manager.list_containers(comando=comando)
-		send_message(message=display_containers(containers), reply_markup=markup)
+		containers = docker_manager.list_containers(server_name, comando=comando)
+		send_message(message=display_containers(containers, server_name), reply_markup=markup)
 	elif comando in ('/run', f'/run@{bot.get_me().username}'):
 		if container_id:
-			run(container_id, container_name)
+			run(container_id, container_name, server_name)
 		else:
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			container_names = [container.name for container in containers if CONTAINER_NAME != container.name]
 			if not container_names:
 				send_message(message=get_text("no_containers_to_start"))
@@ -1618,9 +1789,9 @@ def command_controller(message):
 				save_action_data(TELEGRAM_GROUP, message.message_id, "run", container_names)
 	elif comando in ('/stop', f'/stop@{bot.get_me().username}'):
 		if container_id:
-			stop(container_id, container_name)
+			stop(container_id, container_name, server_name)
 		else:
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			container_names = [container.name for container in containers if CONTAINER_NAME != container.name]
 			if not container_names:
 				send_message(message=get_text("no_containers_to_stop"))
@@ -1632,9 +1803,9 @@ def command_controller(message):
 				save_action_data(TELEGRAM_GROUP, message.message_id, "stop", container_names)
 	elif comando in ('/restart', f'/restart@{bot.get_me().username}'):
 		if container_id:
-			restart(container_id, container_name)
+			restart(container_id, container_name, server_name)
 		else:
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			container_names = [container.name for container in containers if CONTAINER_NAME != container.name]
 			if not container_names:
 				send_message(message=get_text("no_containers_to_restart"))
@@ -1646,11 +1817,11 @@ def command_controller(message):
 				save_action_data(TELEGRAM_GROUP, message.message_id, "restart", container_names)
 	elif comando in ('/logs', f'/logs@{bot.get_me().username}'):
 		if container_id:
-			logs(container_id, container_name)
+			logs(container_id, container_name, server_name)
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'logs|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1659,11 +1830,11 @@ def command_controller(message):
 			send_message(message=get_text("show_logs"), reply_markup=markup)
 	elif comando in ('/logfile', f'/logfile@{bot.get_me().username}'):
 		if container_id:
-			log_file(container_id, container_name)
+			log_file(container_id, container_name, server_name)
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'logfile|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1672,11 +1843,11 @@ def command_controller(message):
 			send_message(message=get_text("show_logsfile"), reply_markup=markup)
 	elif comando in ('/compose', f'/compose@{bot.get_me().username}'):
 		if container_id:
-			compose(container_id, container_name)
+			compose(container_id, container_name, server_name)
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'compose|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1694,11 +1865,11 @@ def command_controller(message):
 		show_schedule_menu(userId, message.chat.id)
 	elif comando in ('/info', f'/info@{bot.get_me().username}'):
 		if container_id:
-			info(container_id, container_name)
+			info(container_id, container_name, server_name)
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'info|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1711,7 +1882,7 @@ def command_controller(message):
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'askCommand|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1724,7 +1895,7 @@ def command_controller(message):
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'confirmDelete|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1733,47 +1904,216 @@ def command_controller(message):
 			send_message(message=get_text("delete_container"), reply_markup=markup)
 	elif comando in ('/checkupdate', f'/checkupdate@{bot.get_me().username}'):
 		if container_id:
-			docker_manager.force_check_update(container_id)
+			docker_manager.force_check_update(container_id, server_name)
 		else:
+			# Trigger background check for this server immediately
+			send_message(message=f"🔄 Checking updates for {server_name}...")
+			
+			def check_server_updates_task(s_name):
+				try:
+					client = docker_client_hub.get_client(s_name)
+					containers = client.containers.list(all=True)
+					for container in containers:
+						# Skip if stopped based on config
+						if (container.status == "exited" or container.status == "dead") and not CHECK_UPDATE_STOPPED_CONTAINERS:
+							continue
+						# Check update logic reused from manager/monitor manually to force cache update
+						try:
+							image = container.attrs['Config']['Image']
+							remote = client.images.pull(image)
+							if container.image.id != remote.id:
+								save_container_update_status(image, container.name, get_text("NEED_UPDATE_CONTAINER_TEXT"))
+								try:
+									client.images.remove(remote.id)
+								except: pass
+							else:
+								save_container_update_status(image, container.name, get_text("UPDATED_CONTAINER_TEXT"))
+						except:
+							pass
+					# Notify done
+					send_message(message=f"✅ Update check finished for {s_name}")
+				except Exception as e:
+					error(f"Manual update check failed for {s_name}: {e}")
+
+			threading.Thread(target=check_server_updates_task, args=(server_name,)).start()
+
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
-				botones.append(InlineKeyboardButton(f'{get_update_emoji(container.name)} {container.name}', callback_data=f'checkUpdate|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
+				botones.append(InlineKeyboardButton(f'{get_update_emoji(container.name, server_name)} {container.name}', callback_data=f'checkUpdate|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
 			markup.add(*botones)
 			markup.add(InlineKeyboardButton(get_text("button_close"), callback_data="cerrar"))
 			send_message(message=get_text("update_container"), reply_markup=markup)
 	elif comando in ('/updateall', f'/updateall@{bot.get_me().username}'):
-		containers = docker_manager.list_containers()
-		containersToUpdate = []
-		for container in containers:
-			if update_available(container):
-				containersToUpdate.append(container.name)
-		if not containersToUpdate:
-			send_message(message=get_text("already_updated_all"))
-			return
+		server_name = get_user_server(userId)
+		
+		# Cache logic: Check if we scanned this server recently (12 hours)
+		cache_key = f"last_scan_{server_name}"
+		last_scan_timestamp = read_cache_item(cache_key)
+		current_time = time.time()
+		CACHE_TTL = 12 * 3600  # 12 hours in seconds
+		
+		print(f"DEBUG: Cache check for {server_name}. Last scan: {last_scan_timestamp}, Now: {current_time}")
+		
+		use_cache = False
+		if last_scan_timestamp and (current_time - last_scan_timestamp < CACHE_TTL):
+			use_cache = True
+			send_message(message=f"📦 Checking updates for {server_name} (Cached)...")
+		else:
+			send_message(message=f"🔄 Checking updates for {server_name} (Full Scan)...")
+		
+		# Helper for fast native pull
+		def fast_pull_image(server_name, image_name):
+			import subprocess
+			
+			url = DOCKER_HOSTS.get(server_name)
+			try:
+				if not url or url == "None" or "unix://" in url:
+					# Local: use docker CLI directly
+					cmd = ["docker", "pull", image_name]
+				elif url.startswith("ssh://"):
+					# Remote: use ssh
+					# Parse ssh://user@host or ssh://alias
+					from urllib.parse import urlparse
+					parsed = urlparse(url)
+					hostname = parsed.hostname
+					port = str(parsed.port) if parsed.port else None
+					user = parsed.username
+					
+					# Build SSH command
+					ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]
+					if port:
+						ssh_cmd.extend(["-p", port])
+					
+					target = hostname
+					if user:
+						target = f"{user}@{hostname}"
+					
+					ssh_cmd.append(target)
+					ssh_cmd.append(f"docker pull {image_name}")
+					cmd = ssh_cmd
+				else:
+					# TCP or other: fallback to docker-py (slow but safe)
+					return False 
 
-		markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
-		markup.add(*[
-			InlineKeyboardButton(f'{ICON_CONTAINER_MARK_FOR_UPDATE} {name}', callback_data=f'toggleUpdate|{name}')
-			for name in containersToUpdate
-		])
-		markup.add(
-			InlineKeyboardButton(get_text("button_update_all"), callback_data="toggleUpdateAll"),
-			InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar")
-		)
-		message = send_message(message=get_text("available_updates", len(containersToUpdate)), reply_markup=markup)
-		if message:
-			save_update_data(TELEGRAM_GROUP, message.message_id, containersToUpdate)
+				# Execute
+				# print(f"DEBUG: Executing fast pull: {' '.join(cmd)}")
+				result = subprocess.run(cmd, capture_output=True, text=True, timeout=300) # 5 min timeout
+				if result.returncode != 0:
+					print(f"DEBUG: Fast pull failed: {result.stderr}")
+					return False
+				return True
+			except Exception as e:
+				print(f"DEBUG: Fast pull exception: {e}")
+				return False
+
+		# Inline function for scanning (blocking for simplicity in thread)
+		def scan_and_show_updates(s_name, chat_id_target, cached_mode):
+			try:
+				client = docker_client_hub.get_client(s_name)
+				containers = client.containers.list(all=True)
+				total = len(containers)
+				containersToUpdate = []
+				
+				# Initial status message
+				status_msg = send_message(chat_id=chat_id_target, message=f"🔄 Checking {s_name}: 0/{total}...")
+				
+				# If NOT using cache, perform the slow scan
+				if not cached_mode:
+					print(f"DEBUG: Starting FULL SCAN for {s_name} (Parallel + Native)")
+					from concurrent.futures import ThreadPoolExecutor, as_completed
+					
+					completed_count = 0
+					
+					def check_single_container(container):
+						try:
+							if (container.status == "exited" or container.status == "dead") and not CHECK_UPDATE_STOPPED_CONTAINERS:
+								return None
+							
+							# ... (fast_pull_image logic) ...
+							image = container.attrs['Config']['Image']
+							
+							# Try fast native pull first
+							if not fast_pull_image(s_name, image):
+								# Fallback to slow python client if native fails
+								client.images.pull(image)
+							
+							remote = client.images.get(image)
+							
+							if container.image.id != remote.id:
+								save_container_update_status(image, container.name, get_text("NEED_UPDATE_CONTAINER_TEXT"))
+								try: client.images.remove(remote.id)
+								except: pass
+								return container.name
+							else:
+								save_container_update_status(image, container.name, get_text("UPDATED_CONTAINER_TEXT"))
+								return None
+						except Exception as e:
+							error(f"Error checking {container.name}: {e}")
+							return None
+
+					# Run checks in parallel
+					with ThreadPoolExecutor(max_workers=10) as executor:
+						futures = {executor.submit(check_single_container, c): c for c in containers}
+						for future in as_completed(futures):
+							if future.result():
+								pass 
+							completed_count += 1
+							# Update progress every 3 items to reduce API spam
+							if completed_count % 3 == 0 or completed_count == total:
+								try:
+									edit_message_text(f"🔄 Checking {s_name}: {completed_count}/{total}...", chat_id_target, status_msg.message_id)
+								except: pass
+					
+					# Save timestamp after successful scan
+					write_cache_item(f"last_scan_{s_name}", time.time())
+					# Final update to Done
+					try:
+						edit_message_text(f"✅ Checked {total} containers on {s_name}", chat_id_target, status_msg.message_id)
+					except: pass
+				else:
+					print(f"DEBUG: Using CACHED data for {s_name}")
+					try:
+						edit_message_text(f"📦 Loaded cached data for {s_name}", chat_id_target, status_msg.message_id)
+					except: pass
+
+				# Collect results (from cache or fresh scan)
+				for container in containers:
+					if update_available(container):
+						containersToUpdate.append(container.name)
+
+				if not containersToUpdate:
+					send_message(chat_id=chat_id_target, message=f"✅ {s_name}: {get_text('already_updated_all')}")
+					return
+
+				markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
+				markup.add(*[
+					InlineKeyboardButton(f'{ICON_CONTAINER_MARK_FOR_UPDATE} {name}', callback_data=f'toggleUpdate|{name}')
+					for name in containersToUpdate
+				])
+				markup.add(
+					InlineKeyboardButton(get_text("button_update_all"), callback_data="toggleUpdateAll"),
+					InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar")
+				)
+				message = send_message(chat_id=chat_id_target, message=f"🚀 {get_text('available_updates', len(containersToUpdate))} ({s_name})", reply_markup=markup)
+				if message:
+					save_update_data(chat_id_target, message.message_id, containersToUpdate, server_name=s_name)
+			
+			except Exception as e:
+				error(f"UpdateAll scan failed: {e}")
+				send_message(chat_id=chat_id_target, message=f"❌ Error scanning {s_name}: {str(e)}")
+
+		threading.Thread(target=scan_and_show_updates, args=(server_name, message.chat.id, use_cache)).start()
 
 	elif comando in ('/changetag', f'/changetag@{bot.get_me().username}'):
 		if container_id:
-			change_tag_container(container_id, container_name)
+			change_tag_container(container_id, container_name, server_name)
 		else:
 			markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
 			botones = []
-			containers = docker_manager.list_containers(comando=comando)
+			containers = docker_manager.list_containers(server_name, comando=comando)
 			for container in containers:
 				botones.append(InlineKeyboardButton(f'{get_status_emoji(container.status, container.name, container)} {container.name}', callback_data=f'changeTagContainer|{container.id[:CONTAINER_ID_LENGTH]}|{container.name}'))
 
@@ -1850,6 +2190,7 @@ def button_controller(call):
 		field = data.get("field")
 		scheduleId = data.get("scheduleId")
 		value = data.get("value")
+		serverNameArg = data.get("serverName")
 
 		debug(f"BUTTON: {comando} | USER: {userId} | CHAT: {chatId}")
 	except Exception as e:
@@ -1859,6 +2200,9 @@ def button_controller(call):
 		except:
 			pass
 		return
+
+	# Get current server
+	server_name = get_user_server(userId)
 
 	try:
 		if comando not in ["toggleUpdate", "toggleUpdateAll", "toggleRun", "toggleRunAll", "toggleStop", "toggleStopAll", "toggleRestart", "toggleRestartAll"]:
@@ -1876,33 +2220,53 @@ def button_controller(call):
 					break
 			return
 
+		# SELECT SERVER
+		if comando == "selectServer":
+			if serverNameArg == "list":
+				# Show server list
+				markup = InlineKeyboardMarkup(row_width=1)
+				for name in docker_client_hub.clients:
+					markup.add(InlineKeyboardButton(f"{'✅ ' if name == server_name else ''}{name}", callback_data=f"selectServer|{name}"))
+				markup.add(InlineKeyboardButton(get_text("button_close"), callback_data="cerrar"))
+				send_message(message=f"🖥 <b>Select Docker Host:</b>\nCurrent: {server_name}", reply_markup=markup)
+			else:
+				if set_user_server(userId, serverNameArg):
+					# Refresh main menu if we are there, or send new menu
+					texto_inicial = f"{get_text('menu')}\n\n🖥 <b>Current Server:</b> {serverNameArg}"
+					markup = InlineKeyboardMarkup(row_width=1)
+					markup.add(InlineKeyboardButton(f"🔄 Switch Server", callback_data="selectServer|list"))
+					send_message(message=texto_inicial, reply_markup=markup)
+				else:
+					send_message(message="Invalid Server Selection")
+			return
+
 		# RUN
 		if comando == "run":
-			run(containerId, containerName)
+			run(containerId, containerName, server_name)
 
 		# STOP
 		elif comando == "stop":
-			stop(containerId, containerName)
+			stop(containerId, containerName, server_name)
 
 		# RESTART
 		elif comando == "restart":
-			restart(containerId, containerName)
+			restart(containerId, containerName, server_name)
 
 		# LOGS
 		elif comando == "logs":
-			logs(containerId, containerName)
+			logs(containerId, containerName, server_name)
 
 		# LOGS EN FICHERO
 		elif comando == "logfile":
-			log_file(containerId, containerName)
+			log_file(containerId, containerName, server_name)
 
 		# COMPOSE
 		elif comando == "compose":
-			compose(containerId, containerName)
+			compose(containerId, containerName, server_name)
 
 		# INFO
 		elif comando == "info":
-			info(containerId, containerName)
+			info(containerId, containerName, server_name)
 
 		# CONFIRM UPDATE
 		elif comando == "confirmUpdate":
@@ -1910,18 +2274,18 @@ def button_controller(call):
 
 		# CHECK UPDATE
 		elif comando == "checkUpdate":
-			docker_manager.force_check_update(containerId)
+			docker_manager.force_check_update(containerId, server_name)
 
 		# UPDATE
 		elif comando == "update":
-			update(containerId, containerName)
+			update(containerId, containerName, server_name)
 
 		# CONFIRM UPDATE ALL
 		elif comando == "updateAll":
-			containers = docker_manager.list_containers()
+			containers = docker_manager.list_containers(server_name)
 			for container in containers:
 				if update_available(container):
-					update(container.id, container.name)
+					update(container.id, container.name, server_name)
 
 		# CONFIRM DELETE
 		elif comando == "confirmDelete":
@@ -1936,7 +2300,7 @@ def button_controller(call):
 			command = load_command_cache(commandId)
 			clear_command_cache(commandId)
 			if command is not None:
-				execute_command(containerId, containerName, command)
+				execute_command(containerId, containerName, command, sendMessage=True, server_name=server_name)
 			else:
 				error(f"Command cache not found for ID: {commandId}")
 				send_message(message=get_text("error_callback_processing"))
@@ -1952,13 +2316,13 @@ def button_controller(call):
 		# DELETE
 		elif comando == "delete":
 			x = send_message(message=get_text("deleting", containerName))
-			result = docker_manager.delete(container_id=containerId, container_name=containerName)
+			result = docker_manager.delete(container_id=containerId, container_name=containerName, server_name=server_name)
 			delete_message(x.message_id)
 			send_message(message=result)
 
 		# CHANGE_TAG_CONTAINER
 		elif comando == "changeTagContainer":
-			change_tag_container(containerId, containerName)
+			change_tag_container(containerId, containerName, server_name)
 
 		# CHANGE_TAG_CONTAINER
 		elif comando == "confirmChangeTag":
@@ -1967,7 +2331,7 @@ def button_controller(call):
 		# CHANGE_TAG
 		elif comando == "changeTag":
 			x = send_message(message=get_text("updating", containerName))
-			result = docker_manager.update(container_id=containerId, container_name=containerName, message=x, bot=bot, tag=tag)
+			result = docker_manager.update(container_id=containerId, container_name=containerName, message=x, bot=bot, server_name=server_name, tag=tag)
 			delete_message(x.message_id)
 			send_message(message=result)
 
@@ -1984,23 +2348,23 @@ def button_controller(call):
 
 		# MARCAR COMO UPDATE
 		elif comando == "toggleUpdate":
-			containers, selected = load_update_data(chatId, messageId)
+			containers, selected, msg_server_name = load_update_data(chatId, messageId)
 			if containerName in selected:
 				selected.remove(containerName)
 			else:
 				selected.add(containerName)
-			save_update_data(chatId, messageId, containers, selected)
+			save_update_data(chatId, messageId, containers, selected, msg_server_name)
 
 			markup = build_generic_keyboard(containers, selected, messageId, "Update", get_text("button_update"), get_text("button_update_all"))
 			edit_message_reply_markup(chatId, messageId, reply_markup=markup)
 
 		# MARCAR COMO UPDATE TODOS
 		elif comando == "toggleUpdateAll":
-			containers, selected = load_update_data(chatId, messageId)
+			containers, selected, msg_server_name = load_update_data(chatId, messageId)
 			for container in containers:
 				if container not in selected:
 					selected.add(container)
-			save_update_data(chatId, messageId, containers, selected)
+			save_update_data(chatId, messageId, containers, selected, msg_server_name)
 
 			markup = build_generic_keyboard(containers, selected, messageId, "Update", get_text("button_update"), get_text("button_update_all"))
 			edit_message_reply_markup(chatId, messageId, reply_markup=markup)
@@ -2011,18 +2375,59 @@ def button_controller(call):
 
 		# UPDATE SELECTED
 		elif comando == "updateSelected":
-			containers, selected = load_update_data(chatId, originalMessageId)
+			containers, selected, msg_server_name = load_update_data(chatId, originalMessageId)
+			# Use the server name associated with this message list!
+			target_server = msg_server_name if msg_server_name else server_name
+			
+			if not selected:
+				send_message(message="❌ No containers selected.")
+				return
+
+			# Progress Card Logic
+			status_lines = {name: "⏳ Pending" for name in selected}
+			
+			def render_card():
+				text = f"🚀 <b>Updating on {target_server}:</b>\n\n"
+				for name, status in status_lines.items():
+					text += f"📦 <b>{name}</b>: {status}\n"
+				return text
+
+			card_msg = send_message(message=render_card())
+			
 			for containerName in selected:
-				container_id = get_container_id_by_name(container_name=containerName)
+				# Update status to Running
+				status_lines[containerName] = "🔄 Updating..."
+				try:
+					edit_message_text(render_card(), chatId, card_msg.message_id)
+				except: pass
+
+				container_id = get_container_id_by_name(container_name=containerName, server_name=target_server)
 				if not container_id:
-					send_message(message=get_text("container_does_not_exist", containerName))
-					debug(f"Container {containerName} not found")
-					continue
-				client = docker.from_env()
-				container = client.containers.get(container_id)
-				if update_available(container):
-					update(container.id, container.name)
+					status_lines[containerName] = "❌ Not found"
+				else:
+					try:
+						# Run update silently
+						result_text = update(container_id, containerName, target_server, silent=True)
+						# Simple heuristic for success based on standard messages
+						if "actualizado con éxito" in result_text or "successfully" in result_text or "updated_container" in result_text:
+							status_lines[containerName] = "✅ Done"
+						else:
+							# If result is an error message, show it briefly or just ⚠️
+							status_lines[containerName] = "⚠️ Failed" 
+					except Exception as e:
+						status_lines[containerName] = "❌ Error"
+						error(f"Update failed for {containerName}: {e}")
+
+				# Update status after action
+				try:
+					edit_message_text(render_card(), chatId, card_msg.message_id)
+				except: pass
+			
 			clear_update_data(chatId, originalMessageId)
+			# Final update
+			try:
+				edit_message_text(render_card() + "\n✨ <b>Process finished.</b>", chatId, card_msg.message_id)
+			except: pass
 
 		# TOGGLE RUN
 		elif comando == "toggleRun":
@@ -2062,12 +2467,12 @@ def button_controller(call):
 		elif comando == "runSelected":
 			containers, selected = load_action_data(chatId, originalMessageId, "run")
 			for containerName in selected:
-				container_id = get_container_id_by_name(container_name=containerName)
+				container_id = get_container_id_by_name(container_name=containerName, server_name=server_name)
 				if not container_id:
 					send_message(message=get_text("container_does_not_exist", containerName))
 					debug(f"Container {containerName} not found")
 					continue
-				run(container_id, containerName)
+				run(container_id, containerName, server_name)
 			clear_action_data(chatId, originalMessageId, "run")
 
 		# TOGGLE STOP
@@ -2108,12 +2513,12 @@ def button_controller(call):
 		elif comando == "stopSelected":
 			containers, selected = load_action_data(chatId, originalMessageId, "stop")
 			for containerName in selected:
-				container_id = get_container_id_by_name(container_name=containerName)
+				container_id = get_container_id_by_name(container_name=containerName, server_name=server_name)
 				if not container_id:
 					send_message(message=get_text("container_does_not_exist", containerName))
 					debug(f"Container {containerName} not found")
 					continue
-				stop(container_id, containerName)
+				stop(container_id, containerName, server_name)
 			clear_action_data(chatId, originalMessageId, "stop")
 
 		# TOGGLE RESTART
@@ -2154,12 +2559,12 @@ def button_controller(call):
 		elif comando == "restartSelected":
 			containers, selected = load_action_data(chatId, originalMessageId, "restart")
 			for containerName in selected:
-				container_id = get_container_id_by_name(container_name=containerName)
+				container_id = get_container_id_by_name(container_name=containerName, server_name=server_name)
 				if not container_id:
 					send_message(message=get_text("container_does_not_exist", containerName))
 					debug(f"Container {containerName} not found")
 					continue
-				restart(container_id, containerName)
+				restart(container_id, containerName, server_name)
 			clear_action_data(chatId, originalMessageId, "restart")
 
 		# PRUNE
@@ -2168,7 +2573,7 @@ def button_controller(call):
 			if action == "confirmPruneContainers":
 				confirm_prune_containers()
 			elif action == "pruneContainers":
-				result, data = docker_manager.prune_containers()
+				result, data = docker_manager.prune_containers(server_name)
 				markup = InlineKeyboardMarkup(row_width = 1)
 				markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
 				fichero_temporal = get_temporal_file(data, get_text("button_containers"))
@@ -2180,7 +2585,7 @@ def button_controller(call):
 			elif action == "confirmPruneImages":
 				confirm_prune_images()
 			elif action == "pruneImages":
-				result, data = docker_manager.prune_images()
+				result, data = docker_manager.prune_images(server_name)
 				markup = InlineKeyboardMarkup(row_width = 1)
 				markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
 				fichero_temporal = get_temporal_file(data, get_text("button_images"))
@@ -2192,7 +2597,7 @@ def button_controller(call):
 			elif action == "confirmPruneNetworks":
 				confirm_prune_networks()
 			elif action == "pruneNetworks":
-				result, data = docker_manager.prune_networks()
+				result, data = docker_manager.prune_networks(server_name)
 				markup = InlineKeyboardMarkup(row_width = 1)
 				markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
 				fichero_temporal = get_temporal_file(data, get_text("button_networks"))
@@ -2204,7 +2609,7 @@ def button_controller(call):
 			elif action == "confirmPruneVolumes":
 				confirm_prune_volumes()
 			elif action == "pruneVolumes":
-				result, data = docker_manager.prune_volumes()
+				result, data = docker_manager.prune_volumes(server_name)
 				markup = InlineKeyboardMarkup(row_width = 1)
 				markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
 				fichero_temporal = get_temporal_file(data, get_text("button_volumes"))
@@ -2576,45 +2981,55 @@ def handle_text(message):
 	else:
 		pass
 
-def run(containerId, containerName, from_schedule=False):
-	debug(f"Running command: run for container {containerName}")
+def run(containerId, containerName, server_name=None, from_schedule=False):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: run for container {containerName} on {server_name}")
 	x = send_message(message=get_text("starting", containerName))
-	result = docker_manager.start_container(container_id=containerId, container_name=containerName, from_schedule=from_schedule)
+	result = docker_manager.start_container(container_id=containerId, container_name=containerName, server_name=server_name, from_schedule=from_schedule)
 	if x:
 		delete_message(x.message_id)
 	if result:
 		send_message(message=result)
 
-def stop(containerId, containerName, from_schedule=False):
-	debug(f"Running command: stop for container {containerName}")
+def stop(containerId, containerName, server_name=None, from_schedule=False):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: stop for container {containerName} on {server_name}")
 	x = send_message(message=get_text("stopping", containerName))
-	result = docker_manager.stop_container(container_id=containerId, container_name=containerName, from_schedule=from_schedule)
+	result = docker_manager.stop_container(container_id=containerId, container_name=containerName, server_name=server_name, from_schedule=from_schedule)
 	if x:
 		delete_message(x.message_id)
 	if result:
 		send_message(message=result)
 
-def restart(containerId, containerName, from_schedule=False):
-	debug(f"Running command: restart for container {containerName}")
+def restart(containerId, containerName, server_name=None, from_schedule=False):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: restart for container {containerName} on {server_name}")
 	x = send_message(message=get_text("restarting", containerName))
-	result = docker_manager.restart_container(container_id=containerId, container_name=containerName, from_schedule=from_schedule)
+	result = docker_manager.restart_container(container_id=containerId, container_name=containerName, server_name=server_name, from_schedule=from_schedule)
 	if x:
 		delete_message(x.message_id)
 	if result:
 		send_message(message=result)
 
-def logs(containerId, containerName):
-	debug(f"Running command: logs for container {containerName}")
+def logs(containerId, containerName, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: logs for container {containerName} on {server_name}")
 	markup = InlineKeyboardMarkup(row_width = 1)
 	markup.add(InlineKeyboardButton(get_text("button_close"), callback_data="cerrar"))
-	result = docker_manager.show_logs(container_id=containerId, container_name=containerName)
+	result = docker_manager.show_logs(container_id=containerId, container_name=containerName, server_name=server_name)
 	send_message(message=result, reply_markup=markup)
 
-def log_file(containerId, containerName):
-	debug(f"Running command: log_file for container {containerName}")
+def log_file(containerId, containerName, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: log_file for container {containerName} on {server_name}")
 	markup = InlineKeyboardMarkup(row_width = 1)
 	markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
-	result = docker_manager.show_logs_raw(container_id=containerId, container_name=containerName)
+	result = docker_manager.show_logs_raw(container_id=containerId, container_name=containerName, server_name=server_name)
 	if isinstance(result, str):
 		fichero_temporal = get_temporal_file(result, f'logs_{containerName}')
 		x = send_message(message=get_text("loading_file"))
@@ -2700,11 +3115,13 @@ def check_mute():
 					_unmute_timer = threading.Timer(mute_until_seconds, unmute)
 					_unmute_timer.start()
 
-def compose(containerId, containerName):
-	debug(f"Running command: compose for container {containerName}")
+def compose(containerId, containerName, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: compose for container {containerName} on {server_name}")
 	markup = InlineKeyboardMarkup(row_width = 1)
 	markup.add(InlineKeyboardButton(get_text("button_delete"), callback_data="cerrar"))
-	result = docker_manager.get_docker_compose(container_id=containerId, container_name=containerName)
+	result = docker_manager.get_docker_compose(container_id=containerId, container_name=containerName, server_name=server_name)
 	if isinstance(result, str) and not result.startswith("Error"):
 		fichero_temporal = io.BytesIO(result.encode('utf-8'))
 		fichero_temporal.name = "docker-compose.txt"
@@ -2715,11 +3132,13 @@ def compose(containerId, containerName):
 	else:
 		send_message(message=result, reply_markup=markup)
 
-def info(containerId, containerName):
-	debug(f"Running command: info for container {containerName}")
+def info(containerId, containerName, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: info for container {containerName} on {server_name}")
 	markup = InlineKeyboardMarkup(row_width = 1)
 	x = send_message(message=get_text("obtaining_info", containerName))
-	result, possible_update = docker_manager.get_info(container_id=containerId, container_name=containerName)
+	result, possible_update = docker_manager.get_info(container_id=containerId, container_name=containerName, server_name=server_name)
 	delete_message(x.message_id)
 	if possible_update:
 		markup.add(InlineKeyboardButton(get_text("button_update"), callback_data=f"confirmUpdate|{containerId}|{containerName}"))
@@ -2777,9 +3196,11 @@ def confirm_execute_command(containerId, containerName, command):
 	markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data=f"cancelExec|{commandId}"))
 	send_message(message=get_text("confirm_exec", containerName, command), reply_markup=markup)
 
-def execute_command(containerId, containerName, command, sendMessage=True):
-	debug(f"Running command: exec for container {containerName} with command [{command}]")
-	result = docker_manager.execute_command(container_id=containerId, container_name=containerName, command=command)
+def execute_command(containerId, containerName, command, sendMessage=True, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	debug(f"Running command: exec for container {containerName} with command [{command}] on {server_name}")
+	result = docker_manager.execute_command(container_id=containerId, container_name=containerName, command=command, server_name=server_name)
 	if sendMessage:
 		max_length = 3500
 		if len(result) <= max_length:
@@ -2797,19 +3218,28 @@ def confirm_change_tag(containerId, containerName, tag):
 	markup.add(InlineKeyboardButton(get_text("button_cancel"), callback_data="cerrar"))
 	send_message(message=get_text("confirm_change_tag", containerName, tag), reply_markup=markup)
 
-def update(containerId, containerName):
-	x = send_message(message=get_text("updating", containerName))
-	result = docker_manager.update(container_id=containerId, container_name=containerName, message=x, bot=bot)
-	delete_message(x.message_id)
-	send_message(message=result)
+def update(containerId, containerName, server_name=None, silent=False):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+	
+	if not silent:
+		x = send_message(message=get_text("updating", containerName))
+		result = docker_manager.update(container_id=containerId, container_name=containerName, message=x, bot=bot, server_name=server_name)
+		delete_message(x.message_id)
+		send_message(message=result)
+		return result
+	else:
+		return docker_manager.update(container_id=containerId, container_name=containerName, message=None, bot=bot, server_name=server_name, silent=True)
 
-def change_tag_container(containerId, containerName):
+def change_tag_container(containerId, containerName, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
 	try:
 		markup = InlineKeyboardMarkup(row_width = BUTTON_COLUMNS)
-		client = docker.from_env()
+		client = docker_client_hub.get_client(server_name)
 		container = client.containers.get(containerId)
 		repo = container.attrs['Config']['Image'].split(":")[0]
-		tags = get_docker_tags(repo)
+		tags = get_docker_tags(repo, server_name) # Need to update get_docker_tags too if it uses client
 
 		if not tags:
 			error(f"Could not get tags for image {repo}")
@@ -2838,7 +3268,7 @@ def confirm_update(containerId, containerName):
 	send_message(message=get_text("confirm_update", containerName), reply_markup=markup)
 
 def confirm_update_selected(chatId, messageId):
-	_, selected = load_update_data(chatId, messageId)
+	_, selected, _ = load_update_data(chatId, messageId)
 	containersToUpdate = ""
 	for container in selected:
 		containersToUpdate += f"· <b>{container}</b>\n"
@@ -2886,15 +3316,19 @@ def update_available(container):
 			pass
 	return update
 
-def display_containers(containers):
+def display_containers(containers, server_name=None):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
+
 	# Calculate statistics
+	# Note: update_available uses local cache, so it's fast
 	total_containers = len(containers)
 	running_containers = sum(1 for c in containers if c.status in ['running', 'restarting'])
 	stopped_containers = sum(1 for c in containers if c.status in ['exited', 'dead'])
 	pending_updates = sum(1 for c in containers if update_available(c))
 
 	# Build summary
-	result = f"📊 <b>{get_text('containers')}:</b> {total_containers}\n"
+	result = f"📊 <b>{get_text('containers')} ({server_name}):</b> {total_containers}\n"
 	result += f"🟢 {get_text('status_running')}: {running_containers}\n"
 	result += f"🔴 {get_text('status_stopped')}: {stopped_containers}\n"
 	result += f"⬆️ {get_text('status_updates')}: {pending_updates}\n\n"
@@ -2903,6 +3337,7 @@ def display_containers(containers):
 	result += "<pre>"
 	for container in containers:
 		result += f"{get_status_emoji(container.status, container.name, container)} {container.name}"
+		# Optimization: Check update status directly instead of calling get_update_emoji which does API call
 		if update_available(container):
 			result += " ⬆️"
 		result += "\n"
@@ -2955,22 +3390,31 @@ def get_status_emoji(statusStr, containerName, container=None):
 		status = "👑"
 	return status
 
-def get_update_emoji(containerName):
-	status = "✅"
+def get_update_emoji(containerName, server_name=None):
+	status = "✅" # Default to green check (Running/No update known)
+	
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
 
-	container_id = get_container_id_by_name(container_name=containerName)
+	container_id = get_container_id_by_name(container_name=containerName, server_name=server_name)
 	if not container_id:
 		return status
 
 	try:
-		client = docker.from_env()
+		# Optimization: Check cache first without creating client if possible
+		# But read_container_update_status needs image name.
+		# We need client to get image name from container.
+		client = docker_client_hub.get_client(server_name)
 		container = client.containers.get(container_id)
 		image_with_tag = container.attrs['Config']['Image']
 		image_status = read_container_update_status(image_with_tag, container.name)
+		
 		if image_status and get_text("NEED_UPDATE_CONTAINER_TEXT") in image_status:
 			status = "⬆️"
+		# If image_status is None or empty, we stick to default ✅
 	except Exception as e:
-		error(f"Could not check update: [{e}]")
+		# If error checking (e.g. timeout), stick to default ✅ to not break UI
+		pass
 
 	return status
 
@@ -3007,10 +3451,12 @@ def get_array_donors_online():
 		error(f"Error getting donors: error code [{response.status_code}]")
 		return []
 
-def get_container_id_by_name(container_name, debugging=False):
+def get_container_id_by_name(container_name, server_name=None, debugging=False):
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
 	if debugging:
-		debug(f"Finding container {container_name}")
-	containers = docker_manager.list_containers()
+		debug(f"Finding container {container_name} on {server_name}")
+	containers = docker_manager.list_containers(server_name)
 	for container in containers:
 		if container.name == container_name:
 			if debugging:
@@ -3059,24 +3505,28 @@ def read_container_update_status(image_with_tag, container_name):
 	key = f'{sanitize_text_for_filename(image_with_tag)}_{sanitize_text_for_filename(container_name)}'
 	return read_cache_item(key)
 
-def save_update_data(chat_id, message_id, containers, selected=None):
+def save_update_data(chat_id, message_id, containers, selected=None, server_name=None):
 	if selected is None:
 		selected = set()
+	if server_name is None:
+		server_name = docker_client_hub.get_default_server()
 	data = {
 		"containers": containers,
-		"selected": selected
+		"selected": selected,
+		"server_name": server_name
 	}
 	write_cache_item(f"update_data_{chat_id}_{message_id}", data)
 
 def load_update_data(chat_id, message_id):
 	data = read_cache_item(f"update_data_{chat_id}_{message_id}")
 	if data is None or not isinstance(data, dict):
-		return [], set()
+		return [], set(), None
 	containers = data.get("containers", [])
 	selected = data.get("selected", set())
+	server_name = data.get("server_name")
 	if not isinstance(selected, set):
 		selected = set(selected)
-	return containers, selected
+	return containers, selected, server_name
 
 def clear_update_data(chat_id, message_id):
 	delete_cache_item(f"update_data_{chat_id}_{message_id}")
@@ -3188,15 +3638,19 @@ def add_if_present(dictionary, key, value):
 def _send_message_direct(chat_id, message, reply_markup, parse_mode, disable_web_page_preview):
 	"""Envía un mensaje directamente sin usar la cola"""
 	try:
+		print(f"DEBUG: Attempting to send message to {chat_id}: {str(message)[:50]}...")
 		if message is None:
 			message = ""
 		if TELEGRAM_THREAD == 1:
-			return bot.send_message(chat_id, message, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
+			result = bot.send_message(chat_id, message, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
 		else:
-			return bot.send_message(chat_id, message, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview, message_thread_id=TELEGRAM_THREAD)
+			result = bot.send_message(chat_id, message, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview, message_thread_id=TELEGRAM_THREAD)
+		print(f"DEBUG: Message sent successfully! MsgID: {result.message_id}")
+		return result
 	except Exception as e:
 		error(f"Error sending message to chat {chat_id}. Message: [{str(message)}]. Error: [{str(e)}]")
-		raise
+		# raise # Don't raise, just log error to keep bot alive
+		return None
 
 def _send_document_direct(chat_id, document, reply_markup, caption, parse_mode):
 	"""Envía un documento directamente sin usar la cola"""
@@ -3235,40 +3689,42 @@ def _edit_message_reply_markup_direct(chat_id, message_id, reply_markup):
 		raise
 
 # ============================================================================
-# FUNCIONES PÚBLICAS CON COLA DE MENSAJES
+# FUNCIONES PÚBLICAS (BYPASS DE COLA - DIRECTAS)
 # ============================================================================
 def delete_message(message_id, chat_id=None):
-	"""Elimina un mensaje usando la cola (asíncrono)"""
+	"""Elimina un mensaje directamente"""
 	if chat_id is None:
 		chat_id = TELEGRAM_GROUP
-	message_queue.add_message(_delete_message_direct, chat_id, message_id, wait_for_result=False)
+	_delete_message_direct(chat_id, message_id)
 
 def send_message(chat_id=TELEGRAM_GROUP, message=None, reply_markup=None, parse_mode="html", disable_web_page_preview=True):
-	"""Envía un mensaje usando la cola (espera resultado para obtener message_id)"""
-	return message_queue.add_message(_send_message_direct, chat_id, message, reply_markup, parse_mode, disable_web_page_preview, wait_for_result=True)
+	"""Envía un mensaje directamente"""
+	return _send_message_direct(chat_id, message, reply_markup, parse_mode, disable_web_page_preview)
 
 def send_message_to_notification_channel(chat_id=TELEGRAM_NOTIFICATION_CHANNEL, message=None, reply_markup=None, parse_mode="html", disable_web_page_preview=True):
-	"""Envía un mensaje al canal de notificaciones usando la cola"""
+	"""Envía un mensaje al canal de notificaciones directamente"""
 	if TELEGRAM_NOTIFICATION_CHANNEL is None or TELEGRAM_NOTIFICATION_CHANNEL == '':
 		return send_message(chat_id=TELEGRAM_GROUP, message=message, reply_markup=reply_markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
 	return send_message(chat_id=chat_id, message=message, reply_markup=reply_markup, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
 
 def send_document(chat_id=TELEGRAM_GROUP, document=None, reply_markup=None, caption=None, parse_mode="html"):
-	"""Envía un documento usando la cola (espera resultado para obtener message_id)"""
-	return message_queue.add_message(_send_document_direct, chat_id, document, reply_markup, caption, parse_mode, wait_for_result=True)
+	"""Envía un documento directamente"""
+	return _send_document_direct(chat_id, document, reply_markup, caption, parse_mode)
 
 def edit_message_text(text, chat_id, message_id, parse_mode="html", reply_markup=None):
-	"""Edita el texto de un mensaje usando la cola (asíncrono, no bloquea si falla)"""
-	message_queue.add_message(_edit_message_text_direct, chat_id, message_id, text, parse_mode, reply_markup, wait_for_result=False)
+	"""Edita el texto de un mensaje directamente"""
+	return _edit_message_text_direct(chat_id, message_id, text, parse_mode, reply_markup)
 
 def edit_message_reply_markup(chat_id, message_id, reply_markup):
-	"""Edita el markup de un mensaje usando la cola (asíncrono)"""
-	message_queue.add_message(_edit_message_reply_markup_direct, chat_id, message_id, reply_markup, wait_for_result=False)
+	"""Edita el markup de un mensaje directamente"""
+	return _edit_message_reply_markup_direct(chat_id, message_id, reply_markup)
 
 def delete_updater():
-	container_id = get_container_id_by_name(UPDATER_CONTAINER_NAME)
+	# Assumes updater is on the default server
+	server_name = docker_client_hub.get_default_server()
+	container_id = get_container_id_by_name(UPDATER_CONTAINER_NAME, server_name=server_name)
 	if container_id:
-		client = docker.from_env()
+		client = docker_client_hub.get_client(server_name)
 		container = client.containers.get(container_id)
 		try:
 			updater_image = container.image.id
@@ -3421,9 +3877,11 @@ def is_valid_cron(cron_expression):
 	except Exception:
 		return False
 
-def get_my_architecture():
+def get_my_architecture(server_name=None):
 	try:
-		client = docker.from_env()
+		if server_name is None:
+			server_name = docker_client_hub.get_default_server()
+		client = docker_client_hub.get_client(server_name)
 		info = client.info()
 		architecture_docker = info['Architecture']
 		return docker_architectures.get(architecture_docker, architecture_docker)
@@ -3431,7 +3889,7 @@ def get_my_architecture():
 		error(f"Error getting Docker architecture: [{e}]")
 		return None
 
-def get_docker_tags(repo_name):
+def get_docker_tags(repo_name, server_name=None):
 	"""Get available tags for a Docker image"""
 	try:
 		if repo_name.startswith("ghcr.io/"):
@@ -3445,22 +3903,22 @@ def get_docker_tags(repo_name):
 		elif repo_name.startswith("lscr.io/"):
 			debug(f"Getting tags from DockerHub for {repo_name}")
 			try:
-				architecture = get_my_architecture()
+				architecture = get_my_architecture(server_name)
 				if architecture is None:
 					error(f"Could not determine system architecture for {repo_name}")
 					return []
-				return get_docker_tags_from_DockerHub(repo_name.replace("lscr.io/", ""))
+				return get_docker_tags_from_DockerHub(repo_name.replace("lscr.io/", ""), architecture)
 			except Exception as e:
 				error(f"Failed to get tags from DockerHub for {repo_name}: {str(e)}")
 				return []
 		else:
 			debug(f"Getting tags from DockerHub for {repo_name}")
 			try:
-				architecture = get_my_architecture()
+				architecture = get_my_architecture(server_name)
 				if architecture is None:
 					error(f"Could not determine system architecture for {repo_name}")
 					return []
-				return get_docker_tags_from_DockerHub(repo_name)
+				return get_docker_tags_from_DockerHub(repo_name, architecture)
 			except Exception as e:
 				error(f"Failed to get tags from DockerHub for {repo_name}: {str(e)}")
 				return []
@@ -3468,8 +3926,11 @@ def get_docker_tags(repo_name):
 		error(f"Failed to get tags for {repo_name}: {str(e)}")
 		return []
 
-def get_docker_tags_from_DockerHub(repo_name):
-	architecture = get_my_architecture()
+def get_docker_tags_from_DockerHub(repo_name, architecture=None):
+	if architecture is None:
+		# Fallback if architecture not passed (should not happen with new calls)
+		architecture = get_my_architecture()
+	
 	if architecture is None:
 		return []
 
@@ -3532,19 +3993,26 @@ schedule_monitor = None
 
 if __name__ == '__main__':
 	debug(f"Starting bot version {VERSION}")
-	eventMonitor = DockerEventMonitor()
-	eventMonitor.demonio_event()
-	debug("Starting event monitor daemon")
-	if CHECK_UPDATES:
-		updateMonitor = DockerUpdateMonitor()
-		updateMonitor.demonio_update()
-		debug("Update daemon started")
-	else:
-		debug("Update daemon disabled")
+	
+	# DAEMONS DISABLED AS REQUESTED - PURELY REACTIVE MODE
+	# No global scanning, no background checks.
+	# User must trigger /checkupdate manually for specific servers.
+	
+	# for server_name, client in docker_client_hub.clients.items():
+	# 	eventMonitor = DockerEventMonitor(client, server_name)
+	# 	eventMonitor.demonio_event()
+	# 	debug(f"Starting event monitor daemon for {server_name}")
 
-	schedule_monitor = DockerScheduleMonitor()
-	schedule_monitor.demonio_schedule()
-	debug("Schedule daemon started")
+	# if CHECK_UPDATES:
+	# 	updateMonitor = DockerUpdateMonitor(docker_client_hub)
+	# 	updateMonitor.demonio_update()
+	# 	debug("Update daemon started")
+	# else:
+	# 	debug("Update daemon disabled")
+
+	# schedule_monitor = DockerScheduleMonitor()
+	# schedule_monitor.demonio_schedule()
+	# debug("Schedule daemon started")
 
 	bot.set_my_commands([
 		telebot.types.BotCommand("/start", get_text("menu_start")),
@@ -3560,6 +4028,7 @@ if __name__ == '__main__':
 		telebot.types.BotCommand("/logs", get_text("menu_logs")),
 		telebot.types.BotCommand("/logfile", get_text("menu_logfile")),
 		telebot.types.BotCommand("/schedule", get_text("menu_schedule")),
+		telebot.types.BotCommand("/server", "Switch Server"), # New command
 		telebot.types.BotCommand("/compose", get_text("menu_compose")),
 		telebot.types.BotCommand("/prune", get_text("menu_prune")),
 		telebot.types.BotCommand("/mute", get_text("menu_mute")),

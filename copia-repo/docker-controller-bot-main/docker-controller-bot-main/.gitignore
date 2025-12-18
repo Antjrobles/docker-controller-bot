@@ -1,0 +1,8 @@
+# MacOS stuff
+.DS_Store
+
+# Local development files and folders
+.env
+__pycache__
+cache
+schedule

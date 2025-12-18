@@ -6,7 +6,7 @@ ENV TZ=UTC \
 WORKDIR /app
 
 # Install runtime dependencies and development tools
-RUN apk add --no-cache python3 py3-pip tzdata
+RUN apk add --no-cache python3 py3-pip tzdata openssh-client
 
 COPY requirements.txt docker-controller-bot.py config.py docker_update.py /app/
 

@@ -14,6 +14,38 @@ LANGUAGE = os.environ.get("LANGUAGE", "ES")
 EXTENDED_MESSAGES = bool(int(os.environ.get("EXTENDED_MESSAGES", "0")))
 BUTTON_COLUMNS = int(os.environ.get("BUTTON_COLUMNS", "2"))
 
+# MULTI-HOST CONFIGURATION
+# Supports two formats:
+# 1. Simple string: "Name1|URL1;Name2|URL2"
+# 2. JSON string: '{"Name1": "URL1", "Name2": "URL2"}' (allows multiline in compose)
+DOCKER_HOSTS_CONFIG = os.environ.get("DOCKER_HOSTS", "")
+DOCKER_HOSTS = {}
+
+if DOCKER_HOSTS_CONFIG:
+    DOCKER_HOSTS_CONFIG = DOCKER_HOSTS_CONFIG.strip()
+    # Try parsing as JSON first
+    if DOCKER_HOSTS_CONFIG.startswith('{'):
+        try:
+            import json
+            DOCKER_HOSTS = json.loads(DOCKER_HOSTS_CONFIG)
+        except json.JSONDecodeError:
+            print("Error parsing DOCKER_HOSTS as JSON. Falling back to simple format.")
+    
+    # Fallback to simple format if JSON failed or not used
+    if not DOCKER_HOSTS:
+        # Normalize separators: replace newlines with semicolons to support multiline env vars
+        normalized_config = DOCKER_HOSTS_CONFIG.replace('\n', ';')
+        for host_def in normalized_config.split(';'):
+            host_def = host_def.strip()
+            if not host_def:
+                continue
+            if '|' in host_def:
+                name, url = host_def.split('|', 1)
+                DOCKER_HOSTS[name.strip()] = url.strip()
+
+if not DOCKER_HOSTS:
+    DOCKER_HOSTS["Local"] = None
+
 # CONSTANTS
 UPDATER_IMAGE = "dgongut/docker-container-updater:latest"
 UPDATER_CONTAINER_NAME = "UPDATER-Docker-Controler-Bot"
@@ -83,6 +115,7 @@ CALL_PATTERNS = {
     "updateSelected": ["originalMessageId"],
     "confirmRunSelected": ["originalMessageId"],
     "runSelected": ["originalMessageId"],
+    "selectServer": ["serverName"],
     "confirmStopSelected": ["originalMessageId"],
     "stopSelected": ["originalMessageId"],
     "confirmRestartSelected": ["originalMessageId"],
